@@ -47,6 +47,7 @@ from torch_geometric.loader import DataLoader
 
 import svgwrite
 import imageio.v3 as iio
+from scipy.stats import spearmanr
 
 # ---- Reproducibility ----
 SEED = 42
@@ -71,6 +72,7 @@ HIDDEN_DIM = 64
 NUM_GAT_HEADS = 4
 NUM_GAT_LAYERS = 3
 NUM_EDGE_TYPES = 7
+EDGE_FEAT_DIM = 10   # 7 one-hot edge type + 3 spatial (norm_dx, norm_dy, norm_dist)
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 EPOCHS = 80
@@ -633,26 +635,173 @@ def create_mixed_pair(layout: FloorLayout, rng: random.Random) -> MultiStoryPair
     )
 
 
-def generate_training_data(layouts: List[FloorLayout], n_pairs: int = 2000) -> List[MultiStoryPair]:
-    """Generate synthetic multi-story pairs: 33% positive, 34% negative, 33% mixed.
+def create_stair_sweep_pair(layout: FloorLayout, rng: random.Random,
+                            shift_frac: float) -> MultiStoryPair:
+    """Pair where ONLY stair is shifted by a controlled amount; rest intact.
 
-    Each of the 122 layouts is reused ~16 times with different random perturbations.
+    shift_frac: 0.0 (perfect) to 1.0 (max shift ~100px).
+    Teaches the GNN to regress stair alignment as a continuous function.
+    """
+    lower = inject_synthetic_stair(layout, rng)
+    upper = _deep_copy_layout(lower)
+
+    if upper.synthetic_stair is not None and shift_frac > 0:
+        max_shift = 100.0
+        shift = shift_frac * max_shift
+        angle = rng.uniform(0, 2 * math.pi)
+        dx = shift * math.cos(angle)
+        dy = shift * math.sin(angle)
+        s = upper.synthetic_stair
+        new_pts = [(x + dx, y + dy) for (x, y) in s.points]
+        s.points = new_pts
+        s.bbox = compute_bbox(new_pts)
+        s.centroid = compute_centroid(new_pts)
+        s.width = s.bbox[2] - s.bbox[0]
+        s.height = s.bbox[3] - s.bbox[1]
+        upper.polygons[s.id] = s
+
+    stair_iou = compute_stair_iou(lower.synthetic_stair, upper.synthetic_stair)
+    wall_align = compute_wall_alignment(lower, upper)
+    door_comply = compute_door_compliance(upper)
+    egress = check_egress(upper)
+    label = (stair_iou + wall_align + door_comply + egress) / 4.0
+    return MultiStoryPair(
+        floor_lower=lower, floor_upper=upper,
+        label=label, stair_iou=stair_iou, wall_overlap=wall_align,
+        door_compliant=door_comply, egress_ok=egress,
+    )
+
+
+def create_wall_sweep_pair(layout: FloorLayout, rng: random.Random,
+                           remove_frac: float) -> MultiStoryPair:
+    """Pair where ONLY walls are removed at a controlled rate; rest intact.
+
+    remove_frac: 0.0 (all walls) to 0.4 (40% removed).
+    """
+    lower = inject_synthetic_stair(layout, rng)
+    upper = _deep_copy_layout(lower)
+
+    if remove_frac > 0 and upper.walls:
+        n_remove = max(1, int(len(upper.walls) * remove_frac))
+        remove_ids = set(w.id for w in rng.sample(
+            upper.walls, min(n_remove, len(upper.walls))))
+        for rid in remove_ids:
+            if rid in upper.polygons:
+                del upper.polygons[rid]
+        upper.walls = [p for p in upper.polygons.values() if p.cls == "Wall"]
+
+    stair_iou = compute_stair_iou(lower.synthetic_stair, upper.synthetic_stair)
+    wall_align = compute_wall_alignment(lower, upper)
+    door_comply = compute_door_compliance(upper)
+    egress = check_egress(upper)
+    label = (stair_iou + wall_align + door_comply + egress) / 4.0
+    return MultiStoryPair(
+        floor_lower=lower, floor_upper=upper,
+        label=label, stair_iou=stair_iou, wall_overlap=wall_align,
+        door_compliant=door_comply, egress_ok=egress,
+    )
+
+
+def create_door_sweep_pair(layout: FloorLayout, rng: random.Random,
+                           shrink_frac: float) -> MultiStoryPair:
+    """Pair where ONLY doors are shrunk at a controlled rate; rest intact.
+
+    shrink_frac: 0.0 (normal) to 1.0 (all shrunk to 30% of original size).
+    """
+    lower = inject_synthetic_stair(layout, rng)
+    upper = _deep_copy_layout(lower)
+
+    if shrink_frac > 0:
+        scale = 1.0 - shrink_frac * 0.7  # 1.0 down to 0.3
+        for d in upper.doors:
+            cx, cy = d.centroid
+            d.points = [(cx + (x - cx) * scale, cy + (y - cy) * scale)
+                        for (x, y) in d.points]
+            d.bbox = compute_bbox(d.points)
+            d.centroid = compute_centroid(d.points)
+            d.width = d.bbox[2] - d.bbox[0]
+            d.height = d.bbox[3] - d.bbox[1]
+            upper.polygons[d.id] = d
+        upper.doors = [p for p in upper.polygons.values() if p.cls == "Door"]
+
+    stair_iou = compute_stair_iou(lower.synthetic_stair, upper.synthetic_stair)
+    wall_align = compute_wall_alignment(lower, upper)
+    door_comply = compute_door_compliance(upper)
+    egress = check_egress(upper)
+    label = (stair_iou + wall_align + door_comply + egress) / 4.0
+    return MultiStoryPair(
+        floor_lower=lower, floor_upper=upper,
+        label=label, stair_iou=stair_iou, wall_overlap=wall_align,
+        door_compliant=door_comply, egress_ok=egress,
+    )
+
+
+def generate_training_data(layouts: List[FloorLayout], n_pairs: int = 2000) -> List[MultiStoryPair]:
+    """Generate multi-story pairs with CONTINUOUS perturbation spectrum.
+
+    Key design change: Instead of 3 discrete categories (pos/neg/mixed), we
+    generate pairs along a continuous perturbation spectrum for EACH coherence
+    dimension INDEPENDENTLY. This forces the GNN to learn smooth regression
+    (tracking spatial distance), not binary classification (pos vs neg).
+
+    When the model only sees fully-broken vs fully-intact pairs, it can only
+    learn a binary classifier. By providing single-dimension sweeps with
+    continuously varying perturbation levels, each scoring head gets a smooth
+    gradient to learn from.
+
+    Distribution:
+    - 10% clean positive (all aligned, ~200)
+    - 25% stair-only sweeps (stair shifted 0-100px, rest intact, ~500)
+    - 25% wall-only sweeps (0-40% walls removed, rest intact, ~500)
+    - 15% door-only sweeps (doors shrunk 0-70%, rest intact, ~300)
+    - 10% multi-dimension (2+ broken at moderate levels, ~200)
+    - 15% fully broken (all dimensions violated, ~300)
     """
     rng = random.Random(SEED)
     pairs = []
-    n_pos = int(n_pairs * 0.33)
-    n_neg = int(n_pairs * 0.34)
-    n_mix = n_pairs - n_pos - n_neg
 
-    for i in range(n_pos):
+    n_pos = int(n_pairs * 0.10)
+    n_stair = int(n_pairs * 0.25)
+    n_wall = int(n_pairs * 0.25)
+    n_door = int(n_pairs * 0.15)
+    n_multi = int(n_pairs * 0.10)
+    n_neg = n_pairs - n_pos - n_stair - n_wall - n_door - n_multi
+
+    # 1. Clean positive pairs (baseline for "fully coherent")
+    for _ in range(n_pos):
         layout = rng.choice(layouts)
         pairs.append(create_positive_pair(layout, rng))
-    for i in range(n_neg):
+
+    # 2. Stair-only sweeps: evenly spaced shift magnitudes 0.0 to 1.0
+    for i in range(n_stair):
         layout = rng.choice(layouts)
-        pairs.append(create_negative_pair(layout, rng))
-    for i in range(n_mix):
+        shift_frac = i / max(n_stair - 1, 1)
+        shift_frac = min(1.0, max(0.0, shift_frac + rng.uniform(-0.05, 0.05)))
+        pairs.append(create_stair_sweep_pair(layout, rng, shift_frac))
+
+    # 3. Wall-only sweeps: evenly spaced removal rates 0.0 to 0.4
+    for i in range(n_wall):
+        layout = rng.choice(layouts)
+        remove_frac = (i / max(n_wall - 1, 1)) * 0.4
+        remove_frac = min(0.4, max(0.0, remove_frac + rng.uniform(-0.02, 0.02)))
+        pairs.append(create_wall_sweep_pair(layout, rng, remove_frac))
+
+    # 4. Door-only sweeps: evenly spaced shrink amounts 0.0 to 1.0
+    for i in range(n_door):
+        layout = rng.choice(layouts)
+        shrink_frac = i / max(n_door - 1, 1)
+        shrink_frac = min(1.0, max(0.0, shrink_frac + rng.uniform(-0.05, 0.05)))
+        pairs.append(create_door_sweep_pair(layout, rng, shrink_frac))
+
+    # 5. Multi-dimension: 2+ dimensions broken at moderate levels
+    for _ in range(n_multi):
         layout = rng.choice(layouts)
         pairs.append(create_mixed_pair(layout, rng))
+
+    # 6. Fully broken: all dimensions violated (old-style negative)
+    for _ in range(n_neg):
+        layout = rng.choice(layouts)
+        pairs.append(create_negative_pair(layout, rng))
 
     rng.shuffle(pairs)
     return pairs
@@ -756,7 +905,7 @@ def build_single_floor_graph(layout: FloorLayout) -> Tuple[torch.Tensor, torch.T
     all_polys = list(layout.polygons.values())
     if not all_polys:
         return (torch.zeros(1, NODE_FEAT_DIM), torch.zeros(2, 0, dtype=torch.long),
-                torch.zeros(0, NUM_EDGE_TYPES), {})
+                torch.zeros(0, EDGE_FEAT_DIM), {})
 
     # Map polygon id -> node index
     id_to_idx = {p.id: i for i, p in enumerate(all_polys)}
@@ -831,18 +980,29 @@ def build_single_floor_graph(layout: FloorLayout) -> Tuple[torch.Tensor, torch.T
                     add_edge(pi.id, pj.id, EDGE_TYPE_MAP["spatial_proximity"])
                     add_edge(pj.id, pi.id, EDGE_TYPE_MAP["spatial_proximity"])
 
-    # Convert to tensors
+    # Convert to tensors with spatial distance features
+    # Edge attr: [7 one-hot type | norm_dx | norm_dy | norm_dist] = 10-dim
+    # Spatial features give the GNN a direct geometric signal for learning
+    # continuous distance regression (not just binary edge type).
     if edges:
         src = torch.tensor([e[0] for e in edges], dtype=torch.long)
         dst = torch.tensor([e[1] for e in edges], dtype=torch.long)
         edge_index = torch.stack([src, dst])
-        # One-hot edge type
-        edge_attr = torch.zeros(len(edges), NUM_EDGE_TYPES)
-        for i, (_, _, etype) in enumerate(edges):
+        edge_attr = torch.zeros(len(edges), EDGE_FEAT_DIM)
+        for i, (si, di, etype) in enumerate(edges):
             edge_attr[i, etype] = 1.0
+            # Spatial features: normalized dx, dy, distance between endpoints
+            p_src = all_polys[si]
+            p_dst = all_polys[di]
+            dx = (p_src.centroid[0] - p_dst.centroid[0]) / max(diag, 1)
+            dy = (p_src.centroid[1] - p_dst.centroid[1]) / max(diag, 1)
+            dist = math.sqrt(dx * dx + dy * dy)
+            edge_attr[i, 7] = dx
+            edge_attr[i, 8] = dy
+            edge_attr[i, 9] = dist
     else:
         edge_index = torch.zeros(2, 0, dtype=torch.long)
-        edge_attr = torch.zeros(0, NUM_EDGE_TYPES)
+        edge_attr = torch.zeros(0, EDGE_FEAT_DIM)
 
     return node_features, edge_index, edge_attr, id_to_idx
 
@@ -884,50 +1044,70 @@ def build_pair_graph(pair: MultiStoryPair) -> Data:
         edge_attr = ea_u
     else:
         edge_index = torch.zeros(2, 0, dtype=torch.long)
-        edge_attr = torch.zeros(0, NUM_EDGE_TYPES)
+        edge_attr = torch.zeros(0, EDGE_FEAT_DIM)
 
-    # Cross-floor edges
+    # Cross-floor edges with spatial distance features.
+    # These are critical for learning continuous alignment: each cross-floor
+    # edge now carries the normalized dx, dy, and distance between the two
+    # connected polygons, giving the model a direct geometric signal.
     cross_edges_src = []
     cross_edges_dst = []
     cross_edge_types = []
+    cross_edge_spatial = []  # (dx_norm, dy_norm, dist_norm) per edge
 
-    # Stair-to-stair link
-    if pair.floor_lower.synthetic_stair and pair.floor_upper.synthetic_stair:
-        sl_id = pair.floor_lower.synthetic_stair.id
-        su_id = pair.floor_upper.synthetic_stair.id
-        if sl_id in id2idx_l and su_id in id2idx_u:
-            li = id2idx_l[sl_id]
-            ui = id2idx_u[su_id] + n_lower
-            cross_edges_src.extend([li, ui])
-            cross_edges_dst.extend([ui, li])
-            cross_edge_types.extend([EDGE_TYPE_MAP["stair_link"]] * 2)
-
-    # Same-class spatial proximity across floors
     polys_l = list(pair.floor_lower.polygons.values())
     polys_u = list(pair.floor_upper.polygons.values())
     diag = math.sqrt(pair.floor_lower.canvas_width**2 + pair.floor_lower.canvas_height**2)
+    diag = max(diag, 1.0)
+
+    # Stair-to-stair link
+    if pair.floor_lower.synthetic_stair and pair.floor_upper.synthetic_stair:
+        sl = pair.floor_lower.synthetic_stair
+        su = pair.floor_upper.synthetic_stair
+        sl_id = sl.id
+        su_id = su.id
+        if sl_id in id2idx_l and su_id in id2idx_u:
+            li = id2idx_l[sl_id]
+            ui = id2idx_u[su_id] + n_lower
+            dx = (sl.centroid[0] - su.centroid[0]) / diag
+            dy = (sl.centroid[1] - su.centroid[1]) / diag
+            dist = math.sqrt(dx * dx + dy * dy)
+            cross_edges_src.extend([li, ui])
+            cross_edges_dst.extend([ui, li])
+            cross_edge_types.extend([EDGE_TYPE_MAP["stair_link"]] * 2)
+            cross_edge_spatial.extend([(dx, dy, dist), (-dx, -dy, dist)])
+
+    # Same-class spatial proximity across floors
     cross_threshold = 0.10 * diag
 
     for pl in polys_l:
         if pl.cls in ("Room", "Wall", "Door", "Window"):
             for pu in polys_u:
                 if pu.cls == pl.cls:
-                    dx = pl.centroid[0] - pu.centroid[0]
-                    dy = pl.centroid[1] - pu.centroid[1]
-                    dist = math.sqrt(dx * dx + dy * dy)
-                    if dist < cross_threshold and pl.id in id2idx_l and pu.id in id2idx_u:
+                    raw_dx = pl.centroid[0] - pu.centroid[0]
+                    raw_dy = pl.centroid[1] - pu.centroid[1]
+                    raw_dist = math.sqrt(raw_dx * raw_dx + raw_dy * raw_dy)
+                    if raw_dist < cross_threshold and pl.id in id2idx_l and pu.id in id2idx_u:
                         li = id2idx_l[pl.id]
                         ui = id2idx_u[pu.id] + n_lower
+                        dx = raw_dx / diag
+                        dy = raw_dy / diag
+                        dist = raw_dist / diag
                         cross_edges_src.extend([li, ui])
                         cross_edges_dst.extend([ui, li])
                         cross_edge_types.extend([EDGE_TYPE_MAP["cross_floor"]] * 2)
+                        cross_edge_spatial.extend([(dx, dy, dist), (-dx, -dy, dist)])
 
-    # Append cross-floor edges
+    # Append cross-floor edges with spatial features
     if cross_edges_src:
         cf_ei = torch.tensor([cross_edges_src, cross_edges_dst], dtype=torch.long)
-        cf_ea = torch.zeros(len(cross_edges_src), NUM_EDGE_TYPES)
+        cf_ea = torch.zeros(len(cross_edges_src), EDGE_FEAT_DIM)
         for i, et in enumerate(cross_edge_types):
             cf_ea[i, et] = 1.0
+            dx, dy, dist = cross_edge_spatial[i]
+            cf_ea[i, 7] = dx
+            cf_ea[i, 8] = dy
+            cf_ea[i, 9] = dist
         edge_index = torch.cat([edge_index, cf_ei], dim=1)
         edge_attr = torch.cat([edge_attr, cf_ea], dim=0)
 
@@ -964,7 +1144,7 @@ class FloorPlanGAT(nn.Module):
         hidden_channels: int = HIDDEN_DIM,
         num_heads: int = NUM_GAT_HEADS,
         num_layers: int = NUM_GAT_LAYERS,
-        edge_dim: int = NUM_EDGE_TYPES,
+        edge_dim: int = EDGE_FEAT_DIM,
         dropout: float = 0.2,
     ):
         super().__init__()
@@ -1080,23 +1260,31 @@ class FloorPlanGAT(nn.Module):
 # ============================================================
 
 class CoherenceLoss(nn.Module):
-    """Multi-task loss: MSE for continuous + BCE for binary heads.
+    """Multi-task loss: SmoothL1 for continuous + BCE for binary heads.
 
-    Weights: stair=1.0, wall=1.0, door=0.5, egress=0.5, overall=2.0.
-    Overall weighted higher to anchor the global coherence signal.
+    Design change: SmoothL1Loss (Huber) replaces MSE for continuous heads.
+    SmoothL1 provides a linear gradient when predictions are far from targets
+    (avoiding the exploding gradient of MSE) and quadratic near the target
+    (smooth convergence). This is critical for learning continuous regression
+    on the stair/wall/overall dimensions where the model previously collapsed
+    to binary classification under MSE.
+
+    Weights: stair=2.0, wall=2.0, door=0.5, egress=0.5, overall=1.5.
+    Stair and wall weighted higher because these are the spatial alignment
+    dimensions that require continuous regression learning.
     """
 
     def __init__(self):
         super().__init__()
-        self.mse = nn.MSELoss()
+        self.smooth_l1 = nn.SmoothL1Loss()
         self.bce = nn.BCELoss()
         self.weights = {
-            "stair": 1.0, "wall": 1.0, "door": 0.5,
-            "egress": 0.5, "overall": 2.0,
+            "stair": 2.0, "wall": 2.0, "door": 0.5,
+            "egress": 0.5, "overall": 1.5,
         }
 
     def forward(self, preds, batch_data):
-        # Gather targets — handle both batched and single
+        # Gather targets
         y_stair = batch_data.y_stair_iou.to(preds["stair_score"].device)
         y_wall = batch_data.y_wall_align.to(preds["stair_score"].device)
         y_door = batch_data.y_door_comply.to(preds["stair_score"].device)
@@ -1116,11 +1304,11 @@ class CoherenceLoss(nn.Module):
         egress_pred = preds["egress_score"].clamp(eps, 1 - eps)
 
         losses = {
-            "stair": self.mse(preds["stair_score"], y_stair),
-            "wall": self.mse(preds["wall_score"], y_wall),
+            "stair": self.smooth_l1(preds["stair_score"], y_stair),
+            "wall": self.smooth_l1(preds["wall_score"], y_wall),
             "door": self.bce(door_pred, y_door),
             "egress": self.bce(egress_pred, y_egress),
-            "overall": self.mse(preds["overall_score"], y_overall),
+            "overall": self.smooth_l1(preds["overall_score"], y_overall),
         }
 
         total = sum(self.weights[k] * losses[k] for k in losses)
@@ -1477,12 +1665,15 @@ def refine_egress(pair, egress_score):
 
 def refinement_loop(model, pair, max_iterations=REFINEMENT_LOOPS,
                     target_score=COHERENCE_THRESHOLD, device=DEVICE):
-    """3-loop iterative refinement: score → identify weakest head → fix → repeat.
+    """3-loop iterative refinement: score -> identify weakest head -> fix -> repeat.
 
-    Returns: (final_pair, actions_per_iteration, scores_per_iteration)
+    Returns: (final_pair, actions_per_iteration, scores_per_iteration,
+              pair_snapshots -- list of deep-copied pair at each step for viz)
     """
     all_actions = []
     all_scores = []
+    # Save the initial broken state and every intermediate state for GIF viz
+    pair_snapshots = [copy.deepcopy(pair)]
 
     for iteration in range(max_iterations):
         scores = _score_pair(model, pair, device)
@@ -1518,14 +1709,15 @@ def refinement_loop(model, pair, max_iterations=REFINEMENT_LOOPS,
             actions = []
 
         all_actions.append(actions)
+        pair_snapshots.append(copy.deepcopy(pair))
         for a in actions:
-            print(f"      → {a.description}")
+            print(f"      -> {a.description}")
 
     # Final score
     final_scores = _score_pair(model, pair, device)
     all_scores.append(final_scores)
 
-    return pair, all_actions, all_scores
+    return pair, all_actions, all_scores, pair_snapshots
 
 
 # ============================================================
@@ -1578,8 +1770,8 @@ def compute_gnn_agent_scores(model, test_pairs, device=DEVICE):
     for idx, (orig_i, pair) in enumerate(broken):
         if idx < 5:
             print(f"  [Refining broken pair {idx+1}/{len(broken)}]")
-        refined, actions, scores = refinement_loop(model, pair, device=device)
-        all_traces.append((refined, actions, scores))
+        refined, actions, scores, snapshots = refinement_loop(model, pair, device=device)
+        all_traces.append((refined, actions, scores, snapshots))
         refined_metrics.append(_ground_truth_metrics(refined))
 
     avg_scores = {k: np.mean([m[k] for m in refined_metrics]) * 100
@@ -1619,8 +1811,9 @@ def print_per_head_breakdown(scores, label="GNN Agent"):
 # ============================================================
 # Section J: Visualization
 # ============================================================
+# Completely rewritten to show clear BEFORE/AFTER comparisons,
+# highlight differences between floors, and animate refinement.
 
-# Color scheme matching CVC-FP conventions
 COLORS = {
     "Wall": "#AFD8F8",
     "Room": "#008E8E",
@@ -1632,18 +1825,35 @@ COLORS = {
 }
 
 
-def plot_floor_layout(layout, ax, title="", highlight_stair=True, highlight_ids=None):
-    """Draw a single floor layout on a matplotlib axes."""
+def _draw_layout_on_ax(layout, ax, title="", ghost_layout=None):
+    """Draw a floor layout. If ghost_layout is given, draw its missing/shifted
+    elements as red dashed outlines (ghost overlay) to highlight differences."""
     ax.set_xlim(0, layout.canvas_width)
-    ax.set_ylim(layout.canvas_height, 0)  # Flip Y axis (SVG convention)
+    ax.set_ylim(layout.canvas_height, 0)
     ax.set_aspect("equal")
     ax.set_title(title, fontsize=10, fontweight="bold")
 
-    # Draw rooms first (background)
+    # If ghost_layout provided, find elements in ghost that are missing or
+    # shifted in the current layout, and draw them as red dashed ghosts.
+    if ghost_layout:
+        current_ids = set(layout.polygons.keys())
+        for gid, gpoly in ghost_layout.polygons.items():
+            if gpoly.cls in ("Stair",):
+                continue  # stair handled separately
+            if gid not in current_ids:
+                # This element was REMOVED from the current layout
+                xs = [p[0] for p in gpoly.points] + [gpoly.points[0][0]]
+                ys = [p[1] for p in gpoly.points] + [gpoly.points[0][1]]
+                ax.fill(xs, ys, color="red", alpha=0.08)
+                ax.plot(xs, ys, color="red", linewidth=2, linestyle="--", alpha=0.6)
+                ax.annotate("MISSING", xy=gpoly.centroid, ha="center", va="center",
+                            fontsize=5, color="red", alpha=0.7)
+
+    # Draw rooms (background fill)
     for room in layout.rooms:
         xs = [p[0] for p in room.points] + [room.points[0][0]]
         ys = [p[1] for p in room.points] + [room.points[0][1]]
-        ax.fill(xs, ys, color=COLORS["Room"], alpha=0.2)
+        ax.fill(xs, ys, color=COLORS["Room"], alpha=0.15)
         ax.plot(xs, ys, color=COLORS["Room"], linewidth=0.5)
 
     # Draw walls
@@ -1651,12 +1861,20 @@ def plot_floor_layout(layout, ax, title="", highlight_stair=True, highlight_ids=
         xs = [p[0] for p in wall.points] + [wall.points[0][0]]
         ys = [p[1] for p in wall.points] + [wall.points[0][1]]
         ax.fill(xs, ys, color=COLORS["Wall"], alpha=0.7)
+        ax.plot(xs, ys, color="#5DADE2", linewidth=0.3)
 
-    # Draw doors
+    # Draw doors -- highlight undersized ones in red
     for door in layout.doors:
         xs = [p[0] for p in door.points] + [door.points[0][0]]
         ys = [p[1] for p in door.points] + [door.points[0][1]]
-        ax.fill(xs, ys, color=COLORS["Door"], alpha=0.7)
+        opening = min(door.width, door.height)
+        if opening < DOOR_MIN_WIDTH_PX:
+            ax.fill(xs, ys, color="red", alpha=0.5)
+            ax.plot(xs, ys, color="darkred", linewidth=2)
+            ax.annotate(f"{opening:.0f}px", xy=door.centroid, ha="center",
+                        va="center", fontsize=5, color="darkred", fontweight="bold")
+        else:
+            ax.fill(xs, ys, color=COLORS["Door"], alpha=0.7)
 
     # Draw windows
     for win in layout.windows:
@@ -1665,103 +1883,162 @@ def plot_floor_layout(layout, ax, title="", highlight_stair=True, highlight_ids=
         ax.fill(xs, ys, color=COLORS["Window"], alpha=0.7)
 
     # Draw stair
-    if highlight_stair and layout.synthetic_stair:
+    if layout.synthetic_stair:
         s = layout.synthetic_stair
         xs = [p[0] for p in s.points] + [s.points[0][0]]
         ys = [p[1] for p in s.points] + [s.points[0][1]]
         ax.fill(xs, ys, color=COLORS["Stair"], alpha=0.5, hatch="//")
-        ax.plot(xs, ys, color=COLORS["Stair"], linewidth=2)
+        ax.plot(xs, ys, color=COLORS["Stair"], linewidth=2.5)
         ax.annotate("STAIR", xy=s.centroid, ha="center", va="center",
                     fontsize=7, fontweight="bold", color="white",
-                    bbox=dict(boxstyle="round,pad=0.2", fc=COLORS["Stair"], alpha=0.8))
+                    bbox=dict(boxstyle="round,pad=0.2", fc=COLORS["Stair"], alpha=0.9))
 
-    # Highlight problem polygons
-    if highlight_ids:
-        for pid in highlight_ids:
-            if pid in layout.polygons:
-                poly = layout.polygons[pid]
-                xs = [p[0] for p in poly.points] + [poly.points[0][0]]
-                ys = [p[1] for p in poly.points] + [poly.points[0][1]]
-                ax.plot(xs, ys, color="red", linewidth=3, linestyle="--")
+        # If ghost layout has a stair at a different position, draw arrow showing offset
+        if ghost_layout and ghost_layout.synthetic_stair:
+            gs = ghost_layout.synthetic_stair
+            dx = s.centroid[0] - gs.centroid[0]
+            dy = s.centroid[1] - gs.centroid[1]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist > 5:  # Only show arrow if meaningful offset
+                # Draw ghost stair position
+                gxs = [p[0] for p in gs.points] + [gs.points[0][0]]
+                gys = [p[1] for p in gs.points] + [gs.points[0][1]]
+                ax.plot(gxs, gys, color="red", linewidth=2, linestyle=":", alpha=0.7)
+                ax.annotate("", xy=s.centroid, xytext=gs.centroid,
+                            arrowprops=dict(arrowstyle="->", color="red",
+                                            lw=2.5, connectionstyle="arc3,rad=0.1"))
+                ax.annotate(f"OFFSET {dist:.0f}px", xy=gs.centroid,
+                            xytext=(gs.centroid[0], gs.centroid[1] - 25),
+                            ha="center", fontsize=6, color="red", fontweight="bold")
 
-    ax.set_xlabel("x (px)", fontsize=8)
-    ax.set_ylabel("y (px)", fontsize=8)
-    ax.tick_params(labelsize=7)
+    ax.tick_params(labelsize=6)
 
 
-def plot_multi_story_pair(pair, scores, save_path, title="Multi-Story Coherence"):
-    """Stacked visualization: two floors + radar score dashboard."""
-    fig = plt.figure(figsize=(16, 10))
-    gs = GridSpec(2, 3, figure=fig, height_ratios=[2, 1])
+def _draw_alignment_lines(ax, layout_lower, layout_upper, y_gap_center, x_range):
+    """Draw vertical alignment lines between two vertically-stacked floors.
+    Green = aligned, Red = misaligned."""
+    for wl in layout_lower.walls:
+        best_iou = 0
+        for wu in layout_upper.walls:
+            iou = _bbox_iou(wl.bbox, wu.bbox)
+            if iou > best_iou:
+                best_iou = iou
+        color = "#27AE60" if best_iou >= WALL_ALIGN_THRESHOLD else "#E74C3C"
+        alpha = 0.3 if best_iou >= WALL_ALIGN_THRESHOLD else 0.5
+        # Draw a small tick at the gap center
+        cx = wl.centroid[0]
+        if x_range[0] <= cx <= x_range[1]:
+            ax.plot([cx, cx], [y_gap_center - 8, y_gap_center + 8],
+                    color=color, linewidth=1.5, alpha=alpha)
 
-    # Floor plans
-    ax1 = fig.add_subplot(gs[0, 0])
-    plot_floor_layout(pair.floor_lower, ax1, title="Floor 1 (Lower)")
-    ax2 = fig.add_subplot(gs[0, 1])
-    plot_floor_layout(pair.floor_upper, ax2, title="Floor 2 (Upper)")
 
-    # Legend
-    ax_leg = fig.add_subplot(gs[0, 2])
-    ax_leg.axis("off")
-    patches = [mpatches.Patch(color=c, label=l, alpha=0.7)
-               for l, c in COLORS.items()]
-    ax_leg.legend(handles=patches, loc="center", fontsize=10, title="Element Types")
+def plot_multi_story_pair(pair, scores, save_path, title="Multi-Story Coherence",
+                          initial_pair=None):
+    """BEFORE/AFTER comparison with vertically stacked floors and alignment indicators.
 
-    # Radar chart
-    ax_radar = fig.add_subplot(gs[1, 0], projection="polar")
-    categories = ["Stair\nAlign", "Wall\nAlign", "Door\nComply", "Egress", "Overall"]
-    values = [scores.get("stair_score", scores.get("stair", 0)),
-              scores.get("wall_score", scores.get("wall", 0)),
-              scores.get("door_score", scores.get("door", 0)),
-              scores.get("egress_score", scores.get("egress", 0)),
-              scores.get("overall_score", scores.get("overall", 0))]
-    # Normalize to [0, 1] if given as percentages
-    values = [v / 100 if v > 1 else v for v in values]
-    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-    values_plot = values + [values[0]]
-    angles_plot = angles + [angles[0]]
-    ax_radar.fill(angles_plot, values_plot, color="#3498DB", alpha=0.3)
-    ax_radar.plot(angles_plot, values_plot, color="#3498DB", linewidth=2)
-    ax_radar.set_xticks(angles)
-    ax_radar.set_xticklabels(categories, fontsize=8)
-    ax_radar.set_ylim(0, 1)
-    ax_radar.set_title("Coherence Scores", fontsize=10, fontweight="bold", pad=20)
+    If initial_pair is given, shows a 2-column layout:
+      Left column: BEFORE (broken) with violations highlighted
+      Right column: AFTER (refined) with fixes highlighted
+    Otherwise shows a single-column stacked view.
+    """
+    cw = pair.floor_lower.canvas_width
+    ch = pair.floor_lower.canvas_height
 
-    # Score table
-    ax_table = fig.add_subplot(gs[1, 1:])
-    ax_table.axis("off")
-    table_data = [
-        ["Stair Alignment", f"{values[0]:.3f}", "PASS" if values[0] > 0.5 else "FAIL"],
-        ["Wall Alignment", f"{values[1]:.3f}", "PASS" if values[1] > 0.5 else "FAIL"],
-        ["Door Compliance", f"{values[2]:.3f}", "PASS" if values[2] > 0.5 else "FAIL"],
-        ["Egress Compliance", f"{values[3]:.3f}", "PASS" if values[3] > 0.5 else "FAIL"],
-        ["Overall Coherence", f"{values[4]:.3f}", "PASS" if values[4] > 0.5 else "FAIL"],
-    ]
-    cell_colors = []
-    for row in table_data:
-        color = "#D5F5E3" if row[2] == "PASS" else "#FADBD8"
-        cell_colors.append([color, color, color])
-    table = ax_table.table(cellText=table_data,
-                           colLabels=["Metric", "Score", "Status"],
-                           cellColours=cell_colors,
-                           loc="center", cellLoc="center")
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.5)
+    if initial_pair is not None:
+        # ---- 2-column BEFORE / AFTER layout ----
+        fig = plt.figure(figsize=(20, 14))
+        gs = GridSpec(3, 2, figure=fig, height_ratios=[1, 1, 0.6], hspace=0.35, wspace=0.3)
 
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-    plt.tight_layout()
+        # BEFORE column (left)
+        ax_b_upper = fig.add_subplot(gs[0, 0])
+        ax_b_lower = fig.add_subplot(gs[1, 0])
+        # Show upper floor with ghost overlay of lower floor to highlight missing walls
+        _draw_layout_on_ax(initial_pair.floor_upper, ax_b_upper,
+                           title="BEFORE: Floor 2 (Upper) -- Broken",
+                           ghost_layout=initial_pair.floor_lower)
+        _draw_layout_on_ax(initial_pair.floor_lower, ax_b_lower,
+                           title="BEFORE: Floor 1 (Lower) -- Reference")
+        ax_b_upper.set_facecolor("#FFF5F5")  # Light red tint
+        # Compute before scores
+        gt_before = _ground_truth_metrics(initial_pair)
+
+        # AFTER column (right)
+        ax_a_upper = fig.add_subplot(gs[0, 1])
+        ax_a_lower = fig.add_subplot(gs[1, 1])
+        _draw_layout_on_ax(pair.floor_upper, ax_a_upper,
+                           title="AFTER: Floor 2 (Upper) -- Refined",
+                           ghost_layout=pair.floor_lower)
+        _draw_layout_on_ax(pair.floor_lower, ax_a_lower,
+                           title="AFTER: Floor 1 (Lower) -- Reference")
+        ax_a_upper.set_facecolor("#F5FFF5")  # Light green tint
+
+        # Score comparison table at bottom
+        ax_table = fig.add_subplot(gs[2, :])
+        ax_table.axis("off")
+        gt_after = _ground_truth_metrics(pair)
+        headers = ["Metric", "Before", "After", "Change", "Status"]
+        rows = []
+        for key, label in [("stair", "Stair Alignment"), ("wall", "Wall Alignment"),
+                           ("door", "Door Compliance"), ("egress", "Egress Compliance"),
+                           ("overall", "Overall Coherence")]:
+            bv = gt_before[key] * 100
+            av = gt_after[key] * 100
+            delta = av - bv
+            sign = "+" if delta >= 0 else ""
+            status = "PASS" if av >= 50 else "FAIL"
+            rows.append([label, f"{bv:.1f}%", f"{av:.1f}%", f"{sign}{delta:.1f}%", status])
+        cell_colors = []
+        for row in rows:
+            if row[4] == "PASS":
+                cell_colors.append(["#D5F5E3"] * 5)
+            else:
+                cell_colors.append(["#FADBD8"] * 5)
+        tbl = ax_table.table(cellText=rows, colLabels=headers,
+                             cellColours=cell_colors, loc="center", cellLoc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(11)
+        tbl.scale(1, 1.8)
+
+        fig.suptitle(title + " -- Before vs After Refinement",
+                     fontsize=15, fontweight="bold")
+    else:
+        # ---- Single view (no initial pair for comparison) ----
+        fig = plt.figure(figsize=(14, 12))
+        gs = GridSpec(3, 2, figure=fig, height_ratios=[1, 1, 0.5], hspace=0.3)
+
+        ax_upper = fig.add_subplot(gs[0, :])
+        ax_lower = fig.add_subplot(gs[1, :])
+        _draw_layout_on_ax(pair.floor_upper, ax_upper, title="Floor 2 (Upper)")
+        _draw_layout_on_ax(pair.floor_lower, ax_lower, title="Floor 1 (Lower)")
+
+        # Radar chart
+        ax_radar = fig.add_subplot(gs[2, 0], projection="polar")
+        categories = ["Stair", "Wall", "Door", "Egress", "Overall"]
+        values = [scores.get("stair_score", scores.get("stair", 0)),
+                  scores.get("wall_score", scores.get("wall", 0)),
+                  scores.get("door_score", scores.get("door", 0)),
+                  scores.get("egress_score", scores.get("egress", 0)),
+                  scores.get("overall_score", scores.get("overall", 0))]
+        values = [v / 100 if v > 1 else v for v in values]
+        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+        vals_p = values + [values[0]]
+        angs_p = angles + [angles[0]]
+        ax_radar.fill(angs_p, vals_p, color="#3498DB", alpha=0.3)
+        ax_radar.plot(angs_p, vals_p, color="#3498DB", linewidth=2)
+        ax_radar.set_xticks(angles)
+        ax_radar.set_xticklabels(categories, fontsize=8)
+        ax_radar.set_ylim(0, 1)
+        ax_radar.set_title("Coherence", fontsize=10, fontweight="bold", pad=15)
+
+        fig.suptitle(title, fontsize=14, fontweight="bold")
+
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"    Saved: {save_path}")
 
 
 def plot_attention_heatmap(model, data, layout_lower, layout_upper, save_path):
-    """Visualize GAT attention weights overlaid on floor geometry.
-
-    Primary explainability visualization: shows which edges the model
-    attends to most when scoring coherence.
-    """
+    """GAT attention weights overlaid on floor geometry."""
     model.eval()
     device = next(model.parameters()).device
     data = data.to(device)
@@ -1772,10 +2049,8 @@ def plot_attention_heatmap(model, data, layout_lower, layout_upper, save_path):
         preds = model(data.x, data.edge_index, data.edge_attr,
                       data.floor_mask, data.batch)
 
-    # Get last-layer attention weights (averaged across heads)
     if model._attention_weights:
         attn = model._attention_weights[-1].cpu().numpy()
-        # Average across heads if multi-head
         if attn.ndim == 2:
             attn_avg = attn.mean(axis=1) if attn.shape[1] > 1 else attn.squeeze()
         else:
@@ -1785,207 +2060,232 @@ def plot_attention_heatmap(model, data, layout_lower, layout_upper, save_path):
         return
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    _draw_layout_on_ax(layout_lower, ax1, title="Floor 1 -- Attention Overlay")
+    _draw_layout_on_ax(layout_upper, ax2, title="Floor 2 -- Attention Overlay")
 
-    # Draw floor layouts
-    plot_floor_layout(layout_lower, ax1, title="Floor 1 — Attention Overlay")
-    plot_floor_layout(layout_upper, ax2, title="Floor 2 — Attention Overlay")
-
-    # Overlay attention as colored edges
     edge_index = data.edge_index.cpu().numpy()
     floor_mask = data.floor_mask.cpu().numpy()
     n_lower = int((floor_mask == 0).sum())
-
     all_polys_lower = list(layout_lower.polygons.values())
     all_polys_upper = list(layout_upper.polygons.values())
 
-    # Normalize attention for colormap
     if len(attn_avg) > 0:
         attn_norm = (attn_avg - attn_avg.min()) / max(attn_avg.max() - attn_avg.min(), 1e-8)
     else:
         attn_norm = np.array([])
 
     cmap = plt.cm.YlOrRd
-
     for ei in range(min(edge_index.shape[1], len(attn_norm))):
         src, dst = edge_index[0, ei], edge_index[1, ei]
         alpha_val = float(attn_norm[ei])
-
-        # Determine which floor
         if src < n_lower and dst < n_lower:
-            # Both on lower floor
             if src < len(all_polys_lower) and dst < len(all_polys_lower):
                 p1 = all_polys_lower[src].centroid
                 p2 = all_polys_lower[dst].centroid
                 ax1.plot([p1[0], p2[0]], [p1[1], p2[1]],
-                        color=cmap(alpha_val), alpha=max(alpha_val, 0.1), linewidth=1)
+                         color=cmap(alpha_val), alpha=max(alpha_val, 0.1), linewidth=1)
         elif src >= n_lower and dst >= n_lower:
-            # Both on upper floor
             si, di = src - n_lower, dst - n_lower
             if si < len(all_polys_upper) and di < len(all_polys_upper):
                 p1 = all_polys_upper[si].centroid
                 p2 = all_polys_upper[di].centroid
                 ax2.plot([p1[0], p2[0]], [p1[1], p2[1]],
-                        color=cmap(alpha_val), alpha=max(alpha_val, 0.1), linewidth=1)
+                         color=cmap(alpha_val), alpha=max(alpha_val, 0.1), linewidth=1)
 
-    # Add colorbar
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
     sm.set_array([])
     fig.colorbar(sm, ax=[ax1, ax2], label="Attention Weight", shrink=0.6)
-
-    fig.suptitle("GAT Attention Heatmap (Last Layer, Avg Heads)", fontsize=13, fontweight="bold")
+    fig.suptitle("GAT Attention Heatmap (Last Layer, Avg Heads)",
+                 fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"    Saved: {save_path}")
 
 
-def create_svg_interactive(pair, scores, actions, save_path):
-    """Create interactive SVG with hover tooltips and pulsing problem highlights."""
+def create_svg_interactive(pair, scores, actions, save_path, initial_pair=None):
+    """Interactive SVG showing before/after with hover tooltips."""
     w = max(pair.floor_lower.canvas_width, pair.floor_upper.canvas_width)
     h = max(pair.floor_lower.canvas_height, pair.floor_upper.canvas_height)
-    total_w = w * 2.2  # Two floors side by side with gap
+    # Layout: 2 columns (before | after), 2 rows (upper | lower)
+    total_w = w * 2.4
+    total_h = h * 2.4 + 120
 
-    dwg = svgwrite.Drawing(save_path, size=(f"{total_w}px", f"{h + 100}px"))
-
-    # CSS for hover tooltips and pulse animation
+    dwg = svgwrite.Drawing(save_path, size=(f"{total_w}px", f"{total_h}px"),
+                           debug=False)
     dwg.defs.add(dwg.style("""
-        .element:hover { stroke: #E74C3C; stroke-width: 3; cursor: pointer; }
-        .tooltip { visibility: hidden; font-size: 12px; }
-        .element:hover + .tooltip { visibility: visible; }
+        .el:hover { stroke: #E74C3C; stroke-width: 3; cursor: pointer; }
+        .tip { visibility: hidden; font-size: 11px; fill: #333; }
+        .el:hover ~ .tip { visibility: visible; }
         @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
-        .problem { animation: pulse 1.5s infinite; stroke: red; stroke-width: 2; }
+        .missing { animation: pulse 1.5s infinite; fill: red; opacity: 0.15;
+                   stroke: red; stroke-width: 2; stroke-dasharray: 8,4; }
     """))
 
-    # Title
-    dwg.add(dwg.text("Multi-Story Floor Plan Coherence",
-                      insert=(total_w / 2, 25), text_anchor="middle",
-                      font_size="18px", font_weight="bold", fill="#2C3E50"))
+    dwg.add(dwg.text("Multi-Story Coherence: Before vs After Refinement",
+                      insert=(total_w / 2, 30), text_anchor="middle",
+                      font_size="20px", font_weight="bold", fill="#2C3E50"))
 
-    def draw_floor(layout, x_offset, y_offset, label):
-        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", label)
-        g = dwg.g(id=f"floor_{safe_id}")
-        dwg.add(dwg.text(label, insert=(x_offset + w / 2, y_offset + 50),
-                         text_anchor="middle", font_size="14px", font_weight="bold"))
-
+    def draw_floor_svg(layout, x_off, y_off, label, ghost=None):
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", label)
+        g = dwg.g(id=f"f_{safe}")
+        g.add(dwg.text(label, insert=(x_off + w / 2, y_off + 20),
+                        text_anchor="middle", font_size="13px", font_weight="bold"))
+        # Ghost missing elements
+        if ghost:
+            current_ids = set(layout.polygons.keys())
+            for gid, gp in ghost.polygons.items():
+                if gp.cls == "Stair":
+                    continue
+                if gid not in current_ids:
+                    pts = [(p[0] + x_off, p[1] + y_off + 30) for p in gp.points]
+                    g.add(dwg.polygon(points=pts, class_="missing"))
+        # Draw elements
         for poly in layout.polygons.values():
-            pts = [(p[0] + x_offset, p[1] + y_offset + 60) for p in poly.points]
-            color = COLORS.get(poly.cls, "#CCCCCC")
-            opacity = 0.5 if poly.cls == "Room" else 0.8
-
-            polygon = dwg.polygon(points=pts, fill=color, opacity=opacity,
-                                  class_="element")
-            polygon.set_desc(title=f"{poly.cls} (id={poly.id})")
-            g.add(polygon)
-
-            # Tooltip
-            tooltip = dwg.text(f"{poly.cls} #{poly.id}",
-                              insert=(poly.centroid[0] + x_offset,
-                                     poly.centroid[1] + y_offset + 55),
-                              class_="tooltip", font_size="9px", fill="#333")
-            g.add(tooltip)
-
-        # Highlight stair with pulse animation
+            pts = [(p[0] + x_off, p[1] + y_off + 30) for p in poly.points]
+            clr = COLORS.get(poly.cls, "#CCC")
+            op = 0.4 if poly.cls == "Room" else 0.75
+            pg = dwg.polygon(points=pts, fill=clr, opacity=op, class_="el")
+            g.add(pg)
+            g.add(dwg.text(f"{poly.cls} #{poly.id}",
+                           insert=(poly.centroid[0] + x_off, poly.centroid[1] + y_off + 25),
+                           class_="tip"))
+        # Stair highlight
         if layout.synthetic_stair:
             s = layout.synthetic_stair
-            pts = [(p[0] + x_offset, p[1] + y_offset + 60) for p in s.points]
-            stair_poly = dwg.polygon(points=pts, fill=COLORS["Stair"],
-                                     opacity=0.6, class_="problem")
-            g.add(stair_poly)
-
+            pts = [(p[0] + x_off, p[1] + y_off + 30) for p in s.points]
+            g.add(dwg.polygon(points=pts, fill=COLORS["Stair"], opacity=0.6,
+                              stroke=COLORS["Stair"], stroke_width=3))
+            g.add(dwg.text("STAIR", insert=(s.centroid[0] + x_off, s.centroid[1] + y_off + 34),
+                           text_anchor="middle", font_size="10px",
+                           font_weight="bold", fill="white"))
         dwg.add(g)
 
-    draw_floor(pair.floor_lower, 10, 0, "Floor 1 (Lower)")
-    draw_floor(pair.floor_upper, w + 30, 0, "Floor 2 (Upper)")
+    col_gap = w * 1.2
+    row_gap = h * 1.1
 
-    # Score dashboard at bottom
-    y_scores = h + 70
-    score_keys = ["stair_score", "wall_score", "door_score", "egress_score", "overall_score"]
-    score_labels = ["Stair", "Wall", "Door", "Egress", "Overall"]
-    for i, (key, label) in enumerate(zip(score_keys, score_labels)):
-        val = scores.get(key, scores.get(key.replace("_score", ""), 0))
-        if val > 1:
-            val = val / 100
-        color = "#27AE60" if val > 0.5 else "#E74C3C"
+    if initial_pair:
+        # Before column
+        dwg.add(dwg.text("BEFORE (Broken)", insert=(w / 2, 55),
+                         text_anchor="middle", font_size="16px",
+                         fill="#E74C3C", font_weight="bold"))
+        draw_floor_svg(initial_pair.floor_upper, 10, 60, "Upper Floor (Broken)",
+                       ghost=initial_pair.floor_lower)
+        draw_floor_svg(initial_pair.floor_lower, 10, 60 + row_gap, "Lower Floor (Reference)")
+
+        # After column
+        dwg.add(dwg.text("AFTER (Refined)", insert=(col_gap + w / 2, 55),
+                         text_anchor="middle", font_size="16px",
+                         fill="#27AE60", font_weight="bold"))
+        draw_floor_svg(pair.floor_upper, col_gap, 60, "Upper Floor (Fixed)")
+        draw_floor_svg(pair.floor_lower, col_gap, 60 + row_gap, "Lower Floor (Reference)")
+    else:
+        draw_floor_svg(pair.floor_lower, 10, 50, "Floor 1 (Lower)")
+        draw_floor_svg(pair.floor_upper, col_gap, 50, "Floor 2 (Upper)")
+
+    # Score bar
+    y_sc = total_h - 40
+    keys = ["stair_score", "wall_score", "door_score", "egress_score", "overall_score"]
+    labels = ["Stair", "Wall", "Door", "Egress", "Overall"]
+    for i, (k, lb) in enumerate(zip(keys, labels)):
+        v = scores.get(k, scores.get(k.replace("_score", ""), 0))
+        if v > 1:
+            v = v / 100
+        clr = "#27AE60" if v > 0.5 else "#E74C3C"
         x = 50 + i * (total_w / 5)
-        dwg.add(dwg.text(f"{label}: {val:.2f}", insert=(x, y_scores),
-                         font_size="12px", fill=color, font_weight="bold"))
+        dwg.add(dwg.text(f"{lb}: {v:.2f}", insert=(x, y_sc),
+                         font_size="13px", fill=clr, font_weight="bold"))
 
     dwg.save()
     print(f"    Saved: {save_path}")
 
 
-def create_refinement_gif(pair_initial, refinement_steps, save_path, fps=1):
-    """Animated GIF showing refinement progress across iterations.
+def create_refinement_gif(pair_snapshots, scores_list, save_path, fps=1):
+    """Animated GIF using actual pair snapshots at each refinement step.
 
-    Each frame: current floor state + scores + action description.
+    pair_snapshots: list of MultiStoryPair at step 0, 1, 2, ...
+    scores_list: list of score dicts at step 0, 1, 2, ...
     """
+    if not pair_snapshots or not scores_list:
+        print(f"    Warning: No snapshots for {save_path}")
+        return
+
     frames = []
 
-    def render_frame(pair, scores, title):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-        plot_floor_layout(pair.floor_lower, ax1, title="Floor 1")
-        plot_floor_layout(pair.floor_upper, ax2, title="Floor 2")
-        fig.suptitle(title, fontsize=12, fontweight="bold")
+    def render_frame(pair, scores, step_label, ref_layout=None):
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
+        # Left: upper floor with ghost overlay showing where reference walls are
+        _draw_layout_on_ax(pair.floor_upper, ax1, title=f"Floor 2 (Upper) -- {step_label}",
+                           ghost_layout=ref_layout)
+        ax1.set_facecolor("#FFFAF0")
+        # Right: lower floor (reference, doesn't change)
+        _draw_layout_on_ax(pair.floor_lower, ax2, title="Floor 1 (Lower) -- Reference")
 
-        # Add score text
-        score_text = " | ".join([
-            f"Stair: {scores.get('stair_score', 0):.2f}",
-            f"Wall: {scores.get('wall_score', 0):.2f}",
-            f"Door: {scores.get('door_score', 0):.2f}",
-            f"Egress: {scores.get('egress_score', 0):.2f}",
-            f"Overall: {scores.get('overall_score', 0):.2f}",
-        ])
-        fig.text(0.5, 0.02, score_text, ha="center", fontsize=9,
+        # Score bar at bottom
+        parts = []
+        for k, lb in [("stair_score", "Stair"), ("wall_score", "Wall"),
+                      ("door_score", "Door"), ("egress_score", "Egress"),
+                      ("overall_score", "Overall")]:
+            v = scores.get(k, 0)
+            parts.append(f"{lb}: {v:.2f}")
+        fig.text(0.5, 0.02, " | ".join(parts), ha="center", fontsize=10,
                  bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
 
-        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+        fig.suptitle(f"Refinement Progress: {step_label}",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout(rect=[0, 0.06, 1, 0.94])
 
-        # Render to numpy array
         fig.canvas.draw()
-        w, h = fig.canvas.get_width_height()
-        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        buf = buf.reshape(h, w, 3)
+        ww, hh = fig.canvas.get_width_height()
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(hh, ww, 3)
         plt.close()
         return buf
 
-    # Frame 0: initial state
-    if refinement_steps:
-        initial_scores = refinement_steps[0][-1][0] if refinement_steps[0][-1] else {}
-        frames.append(render_frame(pair_initial, initial_scores, "Initial (Before Refinement)"))
+    ref = pair_snapshots[0].floor_lower  # reference floor never changes
 
-        # Subsequent frames
-        for i, (refined, actions, scores_list) in enumerate(refinement_steps[:1]):
-            for j, sc in enumerate(scores_list[1:], 1):
-                frames.append(render_frame(refined, sc, f"After Refinement Step {j}"))
+    for i, snap in enumerate(pair_snapshots):
+        if i < len(scores_list):
+            sc = scores_list[i]
+        else:
+            sc = scores_list[-1] if scores_list else {}
+
+        if i == 0:
+            label = "Step 0: Initial (Broken)"
+        else:
+            label = f"Step {i}: After Fix #{i}"
+        frames.append(render_frame(snap, sc, label, ref_layout=ref))
+
+    # Duplicate last frame so the final state lingers
+    if frames:
+        frames.append(frames[-1])
+        frames.append(frames[-1])
 
     if frames:
-        iio.imwrite(save_path, frames, duration=1000 // fps, loop=0)
+        iio.imwrite(save_path, frames, duration=1500, loop=0)
         print(f"    Saved: {save_path}")
-    else:
-        print(f"    Warning: No frames to save for {save_path}")
 
 
 def plot_training_curves(history, save_path):
-    """2×3 subplot grid showing loss curves for all heads."""
+    """2x3 subplot grid showing loss curves for all heads."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     heads = ["total", "stair", "wall", "door", "egress", "overall"]
     titles = ["Total Loss", "Stair Alignment", "Wall Alignment",
               "Door Compliance", "Egress Compliance", "Overall Coherence"]
 
-    for ax, head, title in zip(axes.flat, heads, titles):
-        train_key = f"train_{head}"
-        val_key = f"val_{head}"
-        if train_key in history:
-            ax.plot(history[train_key], label="Train", color="#3498DB")
-        if val_key in history:
-            ax.plot(history[val_key], label="Val", color="#E74C3C")
-        ax.set_title(title, fontsize=10, fontweight="bold")
+    for ax, head, ttl in zip(axes.flat, heads, titles):
+        tk = f"train_{head}"
+        vk = f"val_{head}"
+        if tk in history:
+            ax.plot(history[tk], label="Train", color="#3498DB")
+        if vk in history:
+            ax.plot(history[vk], label="Val", color="#E74C3C")
+        ax.set_title(ttl, fontsize=10, fontweight="bold")
         ax.set_xlabel("Epoch", fontsize=8)
         ax.set_ylabel("Loss", fontsize=8)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    plt.suptitle("Training Curves — Per-Head Loss", fontsize=13, fontweight="bold")
+    plt.suptitle("Training Curves -- Per-Head Loss", fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close()
@@ -2037,10 +2337,11 @@ def main():
     t0 = time.time()
     pairs = generate_training_data(layouts, n_pairs=2000)
     print(f"[SYNTH] Generated {len(pairs)} pairs in {time.time()-t0:.1f}s")
-    pos = sum(1 for p in pairs if p.label > 0.8)
-    neg = sum(1 for p in pairs if p.label < 0.2)
-    mixed = len(pairs) - pos - neg
-    print(f"[SYNTH] Positive: {pos}, Negative: {neg}, Mixed: {mixed}")
+    pos = sum(1 for p in pairs if p.label > 0.9)
+    neg = sum(1 for p in pairs if p.label < 0.1)
+    mid = len(pairs) - pos - neg
+    print(f"[SYNTH] High coherence (>0.9): {pos}, Low (<0.1): {neg}, "
+          f"Continuous spectrum: {mid}")
     # Sample ground-truth scores
     sample = pairs[0]
     print(f"[SYNTH] Sample pair scores: stair_iou={sample.stair_iou:.3f}, "
@@ -2085,6 +2386,206 @@ def main():
     print(f"[TRAIN] Training for up to {EPOCHS} epochs (early stop patience=20)...")
     model, history = train_model(model, train_data, val_data)
 
+    # ---- Stage 6b: Comprehensive Post-Training Diagnostic ----
+    # The GNN (StructuralCritic) must learn CONTINUOUS distance relationships,
+    # not just binary "good/bad". If it fails, the Refiner gets no useful
+    # "colder/warmer" signal and just moves rooms randomly.
+    #
+    # We test this with 3 controlled sweep experiments + scatter analysis:
+    # 1. Stair alignment sweep: shift_frac 0→1, does predicted stair score track GT IoU?
+    # 2. Wall removal sweep: remove_frac 0→0.4, does predicted wall score track GT alignment?
+    # 3. Door shrink sweep: shrink_frac 0→1, does predicted door score track GT compliance?
+    # Success criterion: Spearman rank correlation ≥ 0.7 for continuous heads, ≥ 0.5 for binary.
+    print(f"\n{'=' * 70}")
+    print(f"  POST-TRAINING DIAGNOSTIC: Does the GNN learn distance?")
+    print(f"{'=' * 70}")
+
+    diag_results = {}  # {head_name: {spearman, p_value, monotonic_frac, gt_vals, pred_vals}}
+    n_sweep = 20  # Number of sweep steps per dimension
+
+    # --- Diagnostic 1: Stair Alignment Sweep ---
+    print(f"\n[DIAG 1/3] Stair alignment sweep ({n_sweep} steps, shift_frac 0.0 → 1.0)...")
+    stair_gt, stair_pred = [], []
+    for i in range(n_sweep):
+        frac = i / (n_sweep - 1)  # 0.0 to 1.0
+        diag_rng = random.Random(9999 + i)
+        diag_pair = create_stair_sweep_pair(layouts[i % len(layouts)], diag_rng, shift_frac=frac)
+        sc = _score_pair(model, diag_pair, DEVICE)
+        gt_val = diag_pair.stair_iou
+        pred_val = sc["stair_score"]
+        stair_gt.append(gt_val)
+        stair_pred.append(pred_val)
+        print(f"  shift={frac:.2f} | GT_IoU={gt_val:.3f} | Pred={pred_val:.4f}")
+
+    rho, p_val = spearmanr(stair_gt, stair_pred)
+    mono_pairs = sum(1 for j in range(len(stair_gt)-1)
+                     if (stair_gt[j+1] - stair_gt[j]) * (stair_pred[j+1] - stair_pred[j]) >= 0)
+    mono_frac = mono_pairs / max(len(stair_gt) - 1, 1)
+    diag_results["stair"] = {"spearman": rho, "p_value": p_val, "monotonic_frac": mono_frac,
+                              "gt": stair_gt, "pred": stair_pred}
+    print(f"  Spearman ρ = {rho:.3f} (p={p_val:.4f}), Monotonicity = {mono_frac:.1%}")
+
+    # --- Diagnostic 2: Wall Alignment Sweep ---
+    print(f"\n[DIAG 2/3] Wall removal sweep ({n_sweep} steps, remove_frac 0.0 → 0.4)...")
+    wall_gt, wall_pred = [], []
+    for i in range(n_sweep):
+        frac = i / (n_sweep - 1) * 0.4  # 0.0 to 0.4
+        diag_rng = random.Random(7777 + i)
+        diag_pair = create_wall_sweep_pair(layouts[i % len(layouts)], diag_rng, remove_frac=frac)
+        sc = _score_pair(model, diag_pair, DEVICE)
+        gt_val = diag_pair.wall_overlap
+        pred_val = sc["wall_score"]
+        wall_gt.append(gt_val)
+        wall_pred.append(pred_val)
+        print(f"  remove={frac:.2f} | GT_align={gt_val:.3f} | Pred={pred_val:.4f}")
+
+    rho, p_val = spearmanr(wall_gt, wall_pred)
+    mono_pairs = sum(1 for j in range(len(wall_gt)-1)
+                     if (wall_gt[j+1] - wall_gt[j]) * (wall_pred[j+1] - wall_pred[j]) >= 0)
+    mono_frac = mono_pairs / max(len(wall_gt) - 1, 1)
+    diag_results["wall"] = {"spearman": rho, "p_value": p_val, "monotonic_frac": mono_frac,
+                             "gt": wall_gt, "pred": wall_pred}
+    print(f"  Spearman ρ = {rho:.3f} (p={p_val:.4f}), Monotonicity = {mono_frac:.1%}")
+
+    # --- Diagnostic 3: Door Compliance Sweep ---
+    print(f"\n[DIAG 3/3] Door shrink sweep ({n_sweep} steps, shrink_frac 0.0 → 1.0)...")
+    door_gt, door_pred = [], []
+    for i in range(n_sweep):
+        frac = i / (n_sweep - 1)  # 0.0 to 1.0
+        diag_rng = random.Random(5555 + i)
+        diag_pair = create_door_sweep_pair(layouts[i % len(layouts)], diag_rng, shrink_frac=frac)
+        sc = _score_pair(model, diag_pair, DEVICE)
+        gt_val = diag_pair.door_compliant
+        pred_val = sc["door_score"]
+        door_gt.append(gt_val)
+        door_pred.append(pred_val)
+        print(f"  shrink={frac:.2f} | GT_comply={gt_val:.3f} | Pred={pred_val:.4f}")
+
+    rho, p_val = spearmanr(door_gt, door_pred)
+    mono_pairs = sum(1 for j in range(len(door_gt)-1)
+                     if (door_gt[j+1] - door_gt[j]) * (door_pred[j+1] - door_pred[j]) >= 0)
+    mono_frac = mono_pairs / max(len(door_gt) - 1, 1)
+    diag_results["door"] = {"spearman": rho, "p_value": p_val, "monotonic_frac": mono_frac,
+                             "gt": door_gt, "pred": door_pred}
+    print(f"  Spearman ρ = {rho:.3f} (p={p_val:.4f}), Monotonicity = {mono_frac:.1%}")
+
+    # --- Diagnostic 4: Prediction vs Ground-Truth Scatter Plots ---
+    print(f"\n[DIAG] Generating prediction vs ground-truth scatter plots...")
+    # Collect predictions on the full test set for scatter analysis
+    test_loader_diag = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
+    test_preds = defaultdict(list)
+    test_targets = defaultdict(list)
+    model.eval()
+    with torch.no_grad():
+        for batch_data in test_loader_diag:
+            batch_data = batch_data.to(DEVICE)
+            preds = model(batch_data.x, batch_data.edge_index, batch_data.edge_attr,
+                          batch_data.floor_mask, batch_data.batch)
+            test_preds["stair"].extend(preds["stair_score"].cpu().tolist())
+            test_preds["wall"].extend(preds["wall_score"].cpu().tolist())
+            test_preds["door"].extend(preds["door_score"].cpu().tolist())
+            test_preds["egress"].extend(preds["egress_score"].cpu().tolist())
+            test_preds["overall"].extend(preds["overall_score"].cpu().tolist())
+            test_targets["stair"].extend(batch_data.y_stair_iou.cpu().tolist())
+            test_targets["wall"].extend(batch_data.y_wall_align.cpu().tolist())
+            test_targets["door"].extend(batch_data.y_door_comply.cpu().tolist())
+            test_targets["egress"].extend(batch_data.y_egress.cpu().tolist())
+            test_targets["overall"].extend(batch_data.y_overall.cpu().tolist())
+
+    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+    head_names = ["stair", "wall", "door", "egress", "overall"]
+    head_labels = ["Stair IoU", "Wall Align", "Door Comply", "Egress", "Overall"]
+    r2_scores = {}
+    for ax, hname, hlabel in zip(axes, head_names, head_labels):
+        gt_arr = np.array(test_targets[hname])
+        pr_arr = np.array(test_preds[hname])
+        ax.scatter(gt_arr, pr_arr, alpha=0.4, s=10, c="#2196F3")
+        ax.plot([0, 1], [0, 1], "r--", lw=1, label="Perfect")
+        # R² computation
+        ss_res = np.sum((gt_arr - pr_arr) ** 2)
+        ss_tot = np.sum((gt_arr - np.mean(gt_arr)) ** 2)
+        r2 = 1 - ss_res / max(ss_tot, 1e-12)
+        r2_scores[hname] = r2
+        rho_test, _ = spearmanr(gt_arr, pr_arr)
+        ax.set_title(f"{hlabel}\nR²={r2:.3f}, ρ={rho_test:.3f}", fontsize=10)
+        ax.set_xlabel("Ground Truth")
+        ax.set_ylabel("Predicted")
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_aspect("equal")
+        ax.legend(fontsize=8)
+    plt.suptitle("Post-Training Diagnostic: Predicted vs Ground-Truth (Test Set)", fontsize=13)
+    plt.tight_layout()
+    scatter_path = str(OUTPUT_DIR / "diagnostic_scatter.png")
+    plt.savefig(scatter_path, dpi=150)
+    plt.close()
+    print(f"    Saved: {scatter_path}")
+
+    # --- Diagnostic 5: Sweep scatter plots ---
+    fig2, axes2 = plt.subplots(1, 3, figsize=(18, 5))
+    sweep_data = [
+        ("stair", "Stair: GT IoU vs Predicted", "GT Stair IoU"),
+        ("wall", "Wall: GT Alignment vs Predicted", "GT Wall Alignment"),
+        ("door", "Door: GT Compliance vs Predicted", "GT Door Compliance"),
+    ]
+    for ax, (hname, title, xlabel) in zip(axes2, sweep_data):
+        d = diag_results[hname]
+        ax.scatter(d["gt"], d["pred"], c="#E91E63", s=40, zorder=3)
+        ax.plot(d["gt"], d["pred"], c="#E91E63", alpha=0.3)
+        ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.3, label="Perfect")
+        ax.set_title(f"{title}\nρ={d['spearman']:.3f}, mono={d['monotonic_frac']:.0%}", fontsize=10)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Model Predicted Score")
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_aspect("equal")
+        ax.legend(fontsize=8)
+    plt.suptitle("Sweep Diagnostic: Does the Model Track Geometry Changes?", fontsize=13)
+    plt.tight_layout()
+    sweep_path = str(OUTPUT_DIR / "diagnostic_sweeps.png")
+    plt.savefig(sweep_path, dpi=150)
+    plt.close()
+    print(f"    Saved: {sweep_path}")
+
+    # --- Diagnostic Summary: PASS/FAIL ---
+    print(f"\n  {'=' * 60}")
+    print(f"  DIAGNOSTIC SUMMARY: Can the Refiner get useful signals?")
+    print(f"  {'=' * 60}")
+    print(f"  {'Head':<12} {'Spearman ρ':>12} {'Monotonic':>12} {'R² (test)':>12} {'Result':>10}")
+    print(f"  {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+
+    thresholds = {"stair": 0.7, "wall": 0.7, "door": 0.5}  # Lower bar for binary head
+    all_pass = True
+    for hname in ["stair", "wall", "door"]:
+        d = diag_results[hname]
+        r2 = r2_scores.get(hname, 0)
+        threshold = thresholds[hname]
+        passed = d["spearman"] >= threshold
+        status = "✓ PASS" if passed else "✗ FAIL"
+        if not passed:
+            all_pass = False
+        print(f"  {hname:<12} {d['spearman']:>12.3f} {d['monotonic_frac']:>11.0%} {r2:>12.3f} {status:>10}")
+
+    # Add egress and overall from test-set R² (no sweep for these)
+    for hname in ["egress", "overall"]:
+        r2 = r2_scores.get(hname, 0)
+        rho_test, _ = spearmanr(test_targets[hname], test_preds[hname])
+        passed = rho_test >= 0.5
+        status = "✓ PASS" if passed else "✗ FAIL"
+        if not passed:
+            all_pass = False
+        print(f"  {hname:<12} {rho_test:>12.3f} {'N/A':>12} {r2:>12.3f} {status:>10}")
+
+    print(f"  {'-'*60}")
+    if all_pass:
+        print(f"  ✓ ALL HEADS PASS — The GNN has learned continuous distance.")
+        print(f"    The Refiner WILL get useful 'colder/warmer' signals.")
+    else:
+        print(f"  ✗ SOME HEADS FAILED — The GNN may not track distance for those dims.")
+        print(f"    The Refiner may randomly move rooms for failed dimensions.")
+        print(f"    Consider: more sweep training data, higher loss weights, or more epochs.")
+    print(f"  {'=' * 60}")
+
     # ---- Stage 7-8: Evaluate + Refine ----
     print(f"\n[EVAL] Computing baseline scores (naive stacking)...")
     baseline_scores = compute_baseline_scores(test_pairs_subset)
@@ -2107,30 +2608,42 @@ def main():
     # Training curves
     plot_training_curves(history, str(OUTPUT_DIR / "training_curves.png"))
 
-    # Pick 3 representative examples from refined traces
-    for i in range(min(3, len(traces))):
-        refined_pair, actions_list, scores_list = traces[i]
+    # Pick the 3 MOST BROKEN traces (ones where refinement actually did work)
+    # Sort traces by number of refinement actions taken (most actions = most interesting)
+    interesting = [(idx, t) for idx, t in enumerate(traces)
+                   if len(t[1]) > 0]  # traces with at least 1 action
+    interesting.sort(key=lambda x: len(x[1][1]), reverse=True)  # most actions first
+    if len(interesting) < 3:
+        interesting = list(enumerate(traces))[:3]
+    else:
+        interesting = interesting[:3]
 
-        # Multi-story pair plot with scores
+    for vi, (trace_idx, trace) in enumerate(interesting):
+        refined_pair, actions_list, scores_list, pair_snapshots = trace
+        initial_pair = pair_snapshots[0]  # The broken state before any fixes
+
+        # BEFORE/AFTER comparison plot
         final_scores = scores_list[-1] if scores_list else {}
         plot_multi_story_pair(refined_pair, final_scores,
-                             str(OUTPUT_DIR / f"pair_{i}.png"),
-                             title=f"Example {i+1}: Multi-Story Coherence")
+                             str(OUTPUT_DIR / f"pair_{vi}.png"),
+                             title=f"Example {vi+1}: Multi-Story Coherence",
+                             initial_pair=initial_pair)
 
-        # Attention heatmap
-        pair_data = build_pair_graph(refined_pair)
-        plot_attention_heatmap(model, pair_data,
-                             refined_pair.floor_lower, refined_pair.floor_upper,
-                             str(OUTPUT_DIR / f"attention_{i}.png"))
+        # Attention heatmap on the BROKEN pair (shows what model focuses on)
+        broken_data = build_pair_graph(initial_pair)
+        plot_attention_heatmap(model, broken_data,
+                             initial_pair.floor_lower, initial_pair.floor_upper,
+                             str(OUTPUT_DIR / f"attention_{vi}.png"))
 
-        # Interactive SVG
+        # Interactive SVG with before/after
         flat_actions = [a for al in actions_list for a in al]
         create_svg_interactive(refined_pair, final_scores, flat_actions,
-                              str(OUTPUT_DIR / f"interactive_{i}.svg"))
+                              str(OUTPUT_DIR / f"interactive_{vi}.svg"),
+                              initial_pair=initial_pair)
 
-        # Refinement GIF
-        create_refinement_gif(refined_pair, [traces[i]],
-                             str(OUTPUT_DIR / f"refinement_{i}.gif"))
+        # Refinement GIF using actual snapshots
+        create_refinement_gif(pair_snapshots, scores_list,
+                             str(OUTPUT_DIR / f"refinement_{vi}.gif"))
 
     # Summary
     print(f"\n{'=' * 70}")
@@ -2141,6 +2654,8 @@ def main():
     print(f"    attention_{{0,1,2}}.png — GAT attention weight heatmaps")
     print(f"    interactive_{{0,1,2}}.svg — Hover-interactive SVGs")
     print(f"    refinement_{{0,1,2}}.gif — Animated refinement progress")
+    print(f"    diagnostic_scatter.png — Pred vs GT scatter (5 heads)")
+    print(f"    diagnostic_sweeps.png  — Sweep correlation plots")
     print(f"    best_model.pt         — Trained model checkpoint")
     print(f"{'=' * 70}")
 
