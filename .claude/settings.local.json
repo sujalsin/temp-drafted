@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(du:*)",
+      "WebSearch",
+      "Bash(head:*)",
+      "Bash(file:*)",
+      "Bash(grep:*)",
+      "Bash(for f in /home/sujals2144/drafted/data/cvc_fp/raw_svgs/*.svg)",
+      "Bash(do grep '<nclassappear>' \"$f\")",
+      "Bash(done)",
+      "Bash(python3:*)",
+      "Bash(pip3 list:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)"
+    ]
+  }
+}
